@@ -1,1 +1,1 @@
-
+Archived / Non-Active Scripts: This folder contains previous versions of scripts that are not currently active in production. They are retained for reference or contingency purposes, in case we need to reuse or restore them in the future.
