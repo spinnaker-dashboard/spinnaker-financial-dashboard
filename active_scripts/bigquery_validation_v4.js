@@ -1,0 +1,313 @@
+function runBigQueryValidationv4() {
+  var projectId = 'spinnaker-dev-315722';
+  var dataset = 'dw_develop_extracts';
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getActiveSheet();
+
+  // ---------- Helpers ----------
+  function formatCloseMonth(val) {
+    if (!val) return "";
+    if (Object.prototype.toString.call(val) === "[object Date]" && !isNaN(val)) {
+      var y = val.getFullYear();
+      var m = val.getMonth() + 1;
+      return y.toString() + ('0' + m).slice(-2);
+    }
+    var s = String(val).trim();
+    var digits = s.replace(/\D/g, '');
+    return digits.length >= 6 ? digits.substr(0, 6) : digits;
+  }
+
+  function getPreviousMonth(currMonth) {
+    var y = parseInt(currMonth.substring(0, 4), 10);
+    var m = parseInt(currMonth.substring(4, 6), 10) - 1;
+    if (m === 0) { m = 12; y -= 1; }
+    return y.toString() + ('0' + m).slice(-2);
+  }
+
+  function numVal(v) {
+    if (v === null || v === "") return 0;
+    if (typeof v === 'number') return v;
+    var s = String(v).trim().replace(/[, ]+/g, '');
+    var f = parseFloat(s);
+    return isNaN(f) ? 0 : f;
+  }
+
+  function growth(curr, prev) {
+    if (!prev || prev === 0) return "";
+    return (curr - prev) / prev;
+  }
+
+  // ---------- Inputs ----------
+  var rawMonth = sheet.getRange("C4").getValue();
+  var currMonth = formatCloseMonth(rawMonth);
+  if (!currMonth || currMonth.length < 6) {
+    SpreadsheetApp.getUi().alert("Invalid Close Month in C4. Use YYYYMM or a date cell.");
+    return;
+  }
+  currMonth = currMonth.substr(0, 6);
+  var prevMonth = getPreviousMonth(currMonth);
+
+  var programRawInput = sheet.getRange("C5").getValue();
+  if (!programRawInput) {
+    SpreadsheetApp.getUi().alert("Please set Program in C5.");
+    return;
+  }
+  var programRaw = String(programRawInput).trim();
+
+  // ---------- Program mapping ----------
+  var programMap = {
+    "Ahoy": "ahoy", "Battleface": "battleface", "Amrisc": "amrisc",
+    "Annex-flood": "annex-flood", "Arrowhead": "arrowhead", "Cabrillo": "cbr",
+    "Coterie": "coterie", "Euclid": "euclid", "HDVI": "hdvi", "MileAuto": "mileauto",
+    "Outdoorsy": "outdoorsy", "RVP": "rvp", "Simply Business": "sb",
+    "sola": "sola", "boost-cyber": "boost-cyber", "rg": "rg", "hippo": "hippo"
+  };
+
+  var bqProgram = programMap[programRaw] ||
+    Object.keys(programMap).find(k => k.toLowerCase() === programRaw.toLowerCase());
+  if (!bqProgram) {
+    SpreadsheetApp.getUi().alert("Program not found in mapping: '" + programRaw + "'. Check C5 value.");
+    return;
+  }
+
+  sheet.getRange("E4").setValue(programRaw);
+
+  // ---------- BigQuery helper ----------
+  function runQuery(sql) {
+    var request = { query: sql, useLegacySql: false };
+    var queryResults = BigQuery.Jobs.query(request, projectId);
+    if (!queryResults || !queryResults.rows) return {};
+    var out = {};
+    var fields = queryResults.schema?.fields || [];
+    queryResults.rows.forEach(function(r, i) {
+      if (i === 0) {
+        r.f.forEach(function(cell, idx) {
+          var fname = fields[idx].name;
+          out[fname] = cell.v;
+        });
+      }
+    });
+    return out;
+  }
+
+  // ---------- BigQuery Queries ----------
+  var policiesCurr = runQuery(`
+    SELECT COUNT(*) AS policy_count,
+           SUM(gross_premium_written) AS GPW,
+           SUM(gross_premium_earned) AS GPE
+    FROM \`${projectId}.${dataset}.ext_policies\`
+    WHERE CAST(close_month AS STRING)='${currMonth}'
+      AND LOWER(CAST(program AS STRING))=LOWER('${bqProgram}')
+  `);
+
+  var policiesPrev = runQuery(`
+    SELECT COUNT(*) AS policy_count,
+           SUM(gross_premium_written) AS GPW,
+           SUM(gross_premium_earned) AS GPE
+    FROM \`${projectId}.${dataset}.ext_policies\`
+    WHERE CAST(close_month AS STRING)='${prevMonth}'
+      AND LOWER(CAST(program AS STRING))=LOWER('${bqProgram}')
+  `);
+
+  var cashCurr = runQuery(`
+    SELECT SUM(raw_collected_cash) AS CollectedPremium
+    FROM \`${projectId}.${dataset}.ext_cash\`
+    WHERE CAST(close_month AS STRING)='${currMonth}'
+      AND LOWER(CAST(program AS STRING))=LOWER('${bqProgram}')
+  `);
+
+  var cashPrev = runQuery(`
+    SELECT SUM(raw_collected_cash) AS CollectedPremium
+    FROM \`${projectId}.${dataset}.ext_cash\`
+    WHERE CAST(close_month AS STRING)='${prevMonth}'
+      AND LOWER(CAST(program AS STRING))=LOWER('${bqProgram}')
+  `);
+
+  var claimsCurr = runQuery(`
+    SELECT COUNT(*) AS claim_count,
+           SUM(indemnity_paid_itd) AS loss_paid,
+           SUM(alae_paid_itd) AS alae_paid
+    FROM \`${projectId}.${dataset}.ext_claims\`
+    WHERE CAST(close_month AS STRING)='${currMonth}'
+      AND LOWER(CAST(program AS STRING))=LOWER('${bqProgram}')
+  `);
+
+  var claimsPrev = runQuery(`
+    SELECT COUNT(*) AS claim_count,
+           SUM(indemnity_paid_itd) AS loss_paid,
+           SUM(alae_paid_itd) AS alae_paid
+    FROM \`${projectId}.${dataset}.ext_claims\`
+    WHERE CAST(close_month AS STRING)='${prevMonth}'
+      AND LOWER(CAST(program AS STRING))=LOWER('${bqProgram}')
+  `);
+
+  // ---------- Raw Data Helpers ----------
+  var rawSheet = ss.getSheetByName("raw data");
+  var rawSheet2 = ss.getSheetByName("raw data2");
+  var rawSheet3 = ss.getSheetByName("raw data3"); // Month-to-Date source
+
+  function getRawValues(sheetObj, month, program, isMTD) {
+    var values = sheetObj.getDataRange().getValues();
+    var result = { GPW: 0, GPE: 0, Collected: 0, PolicyCount: 0, PaidLoss: 0, PaidExpense: 0, ClaimCount: 0 };
+    for (var i = 1; i < values.length; i++) {
+      var rowMonth = formatCloseMonth(values[i][0]);
+      var rowProgram = String(values[i][1]).trim();
+      if (rowMonth === month && rowProgram === program) {
+        // raw data3 mapping (A:I)
+        if (isMTD) {
+          result.GPW += Number(values[i][2]) || 0;          // GrossWrittenPremium
+          result.GPE += Number(values[i][3]) || 0;          // EarnedPremium
+          result.Collected += Number(values[i][4]) || 0;    // CollectedPremium
+          result.PolicyCount += Number(values[i][5]) || 0;  // Policy_Count
+          result.PaidLoss += Number(values[i][6]) || 0;     // Paid_Loss
+          result.PaidExpense += Number(values[i][7]) || 0;  // Paid_Expense
+          result.ClaimCount += Number(values[i][8]) || 0;   // Claim_Count
+        } else {
+          result.GPW += Number(values[i][2]) || 0;
+          result.GPE += Number(values[i][3]) || 0;
+          result.Collected += Number(values[i][4]) || 0;
+          result.PaidLoss += Number(values[i][5]) || 0;
+          result.PaidExpense += Number(values[i][6]) || 0;
+          result.ClaimCount += Number(values[i][7]) || 0;
+          result.PolicyCount += Number(values[i][8]) || 0;
+        }
+      }
+    }
+    return result;
+  }
+
+  // ---------- Raw Data Extraction ----------
+  var rawCurr = getRawValues(rawSheet, currMonth, programRaw, false);
+  var rawPrev = getRawValues(rawSheet, prevMonth, programRaw, false);
+  var raw2Curr = getRawValues(rawSheet2, currMonth, programRaw, false);
+  var raw2Prev = getRawValues(rawSheet2, prevMonth, programRaw, false);
+  var rawMTD = getRawValues(rawSheet3, currMonth, programRaw, true);
+
+  if (raw2Curr && !isNaN(Number(raw2Curr.GPW))) rawCurr.GPW = raw2Curr.GPW;
+  if (raw2Prev && !isNaN(Number(raw2Prev.GPW))) rawPrev.GPW = raw2Prev.GPW;
+
+  // ---------- Populate Raw & BigQuery & MTD ----------
+  // Raw Previous (F), Current (G)
+
+  sheet.getRange("F6").setValue(prevMonth); // Previous (Raw)
+  sheet.getRange("G6").setValue(currMonth); // Current (Raw)
+  sheet.getRange("F12").setValue(prevMonth); // Previous (Raw - Claims Section)
+  sheet.getRange("G12").setValue(currMonth); // Current (Raw - Claims Section)
+  sheet.getRange("J6").setValue(currMonth); // Current (Raw)
+
+
+  sheet.getRange("F7").setValue(numVal(rawPrev.GPW));
+  sheet.getRange("G7").setValue(numVal(rawCurr.GPW));
+  sheet.getRange("F8").setValue(numVal(rawPrev.GPE));
+  sheet.getRange("G8").setValue(numVal(rawCurr.GPE));
+  sheet.getRange("F9").setValue(numVal(rawPrev.Collected));
+  sheet.getRange("G9").setValue(numVal(rawCurr.Collected));
+  sheet.getRange("F10").setValue(numVal(rawPrev.PolicyCount));
+  sheet.getRange("G10").setValue(numVal(rawCurr.PolicyCount));
+  sheet.getRange("F13").setValue(numVal(rawPrev.PaidLoss));
+  sheet.getRange("G13").setValue(numVal(rawCurr.PaidLoss));
+  sheet.getRange("F14").setValue(numVal(rawPrev.PaidExpense));
+  sheet.getRange("G14").setValue(numVal(rawCurr.PaidExpense));
+  sheet.getRange("F15").setValue(numVal(rawPrev.ClaimCount));
+  sheet.getRange("G15").setValue(numVal(rawCurr.ClaimCount));
+
+  // Month-to-Date 
+  sheet.getRange("J7").setValue(numVal(rawMTD.GPW));
+  sheet.getRange("J8").setValue(numVal(rawMTD.GPE));
+  sheet.getRange("J9").setValue(numVal(rawMTD.Collected));
+  //sheet.getRange("J10").setValue(numVal(rawMTD.PolicyCount));
+  //sheet.getRange("J13").setValue(numVal(rawMTD.PaidLoss));
+  //sheet.getRange("J14").setValue(numVal(rawMTD.PaidExpense));
+  //sheet.getRange("J15").setValue(numVal(rawMTD.ClaimCount));
+
+  // ---------- Compute Raw Delta + Match/Mismatch ----------
+  computeRawDeltaAndMatch();
+
+  function computeRawDeltaAndMatch() {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+
+  // Define metrics and target rows
+  var metrics = [
+    { name: "Gross Written Premium", row: 7 },
+    { name: "Gross Earned Premium",  row: 8 },
+    { name: "Collected Premium",     row: 9 }
+  ];
+
+  metrics.forEach(function(metric) {
+    var prevVal = Number(sheet.getRange("F" + metric.row).getValue()) || 0;
+    var currVal = Number(sheet.getRange("G" + metric.row).getValue()) || 0;
+    var mtdVal  = Number(sheet.getRange("J" + metric.row).getValue()) || 0;
+
+    var delta = currVal - prevVal;
+    sheet.getRange("I" + metric.row).setValue(delta);
+
+    var tolerance = 0.01;
+    var status = Math.abs(delta - mtdVal) < tolerance ? "Match" : "Mismatch";
+    sheet.getRange("K" + metric.row).setValue(status);
+  });
+
+  SpreadsheetApp.flush();
+}
+
+  // BigQuery
+
+  sheet.getRange("L6").setValue(prevMonth); // Previous (BigQuery)
+  sheet.getRange("M6").setValue(currMonth); // Current (BigQuery)
+  sheet.getRange("L12").setValue(prevMonth); // Previous (BigQuery - Claims Section)
+  sheet.getRange("M12").setValue(currMonth); // Current (BigQuery - Claims Section)
+
+  sheet.getRange("L7").setValue(numVal(policiesPrev.GPW));
+  sheet.getRange("M7").setValue(numVal(policiesCurr.GPW));
+  sheet.getRange("L8").setValue(numVal(policiesPrev.GPE));
+  sheet.getRange("M8").setValue(numVal(policiesCurr.GPE));
+  sheet.getRange("L9").setValue(numVal(cashPrev.CollectedPremium));
+  sheet.getRange("M9").setValue(numVal(cashCurr.CollectedPremium));
+  sheet.getRange("L10").setValue(numVal(policiesPrev.policy_count));
+  sheet.getRange("M10").setValue(numVal(policiesCurr.policy_count));
+  sheet.getRange("L13").setValue(numVal(claimsPrev.loss_paid));
+  sheet.getRange("M13").setValue(numVal(claimsCurr.loss_paid));
+  sheet.getRange("L14").setValue(numVal(claimsPrev.alae_paid));
+  sheet.getRange("M14").setValue(numVal(claimsCurr.alae_paid));
+  sheet.getRange("L15").setValue(numVal(claimsPrev.claim_count));
+  sheet.getRange("M15").setValue(numVal(claimsCurr.claim_count));
+
+  // ---------- Growth Table ----------
+  sheet.getRange("H7").setValue(growth(rawCurr.GPW, rawPrev.GPW));
+  sheet.getRange("H8").setValue(growth(rawCurr.GPE, rawPrev.GPE));
+  sheet.getRange("H9").setValue(growth(rawCurr.Collected, rawPrev.Collected));
+  sheet.getRange("H10").setValue(growth(rawCurr.PolicyCount, rawPrev.PolicyCount));
+  sheet.getRange("H13").setValue(growth(rawCurr.PaidLoss, rawPrev.PaidLoss));
+  sheet.getRange("H14").setValue(growth(rawCurr.PaidExpense, rawPrev.PaidExpense));
+  sheet.getRange("H15").setValue(growth(rawCurr.ClaimCount, rawPrev.ClaimCount));
+
+  sheet.getRange("N7").setValue(growth(numVal(policiesCurr.GPW), numVal(policiesPrev.GPW)));
+  sheet.getRange("N8").setValue(growth(numVal(policiesCurr.GPE), numVal(policiesPrev.GPE)));
+  sheet.getRange("N9").setValue(growth(numVal(cashCurr.CollectedPremium), numVal(cashPrev.CollectedPremium)));
+  sheet.getRange("N10").setValue(growth(numVal(policiesCurr.policy_count), numVal(policiesPrev.policy_count)));
+  sheet.getRange("N13").setValue(growth(numVal(claimsCurr.loss_paid), numVal(claimsPrev.loss_paid)));
+  sheet.getRange("N14").setValue(growth(numVal(claimsCurr.alae_paid), numVal(claimsPrev.alae_paid)));
+  sheet.getRange("N15").setValue(growth(numVal(claimsCurr.claim_count), numVal(claimsPrev.claim_count)));
+
+  // ---------- Delta Table ----------
+  var deltaMetrics = [
+    { name: "Gross Written Premium", row: 7, bq: policiesCurr.GPW, raw: rawCurr.GPW },
+    { name: "Gross Earned Premium",  row: 8, bq: policiesCurr.GPE, raw: rawCurr.GPE },
+    { name: "Collected Premium",     row: 9, bq: cashCurr.CollectedPremium, raw: rawCurr.Collected },
+    { name: "Policy Count",          row: 10, bq: policiesCurr.policy_count, raw: rawCurr.PolicyCount },
+    { name: "Paid Loss",             row: 13, bq: claimsCurr.loss_paid, raw: rawCurr.PaidLoss },
+    { name: "Paid Expense",          row: 14, bq: claimsCurr.alae_paid, raw: rawCurr.PaidExpense },
+    { name: "Claim Count",           row: 15, bq: claimsCurr.claim_count, raw: rawCurr.ClaimCount }
+  ];
+
+  deltaMetrics.forEach(function(metric) {
+    var delta = numVal(metric.bq) - numVal(metric.raw);
+    var tolerance = 0.01;
+    if (Math.abs(delta) < tolerance) delta = 0;
+    sheet.getRange("O" + metric.row).setValue(delta);
+    var status = (delta === 0) ? "Match" : "Mismatch";
+    sheet.getRange("P" + metric.row).setValue(status);
+  });
+
+  applyGrowthTextColorFormatting_v2();
+}
+
